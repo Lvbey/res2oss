@@ -66,14 +66,14 @@ jobs:
               filename="${filename}_${line_num}"
               local_file="${WORKDIR}/${filename}"
             fi
-
+            DATETIMESTR=$(date +"%Y%m%d")
             echo "Downloading: $url -> $filename"
             if curl -fSL --retry 3 --retry-delay 5 --connect-timeout 30 -o "$local_file" "$url"; then
               # Determine OSS target path
               if [[ -n "$OSS_PATH" ]]; then
-                oss_target="oss://${OSS_BUCKET}/${OSS_PATH}/${filename}"
+                oss_target="oss://${OSS_BUCKET}/${OSS_PATH}/${DATETIMESTR}_${filename}"
               else
-                oss_target="oss://${OSS_BUCKET}/${filename}"
+                oss_target="oss://${OSS_BUCKET}/${DATETIMESTR}_${filename}"
               fi
 
               echo "Uploading: $local_file -> $oss_target"
