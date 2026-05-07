@@ -1,0 +1,103 @@
+name: Upload to Alibaba OSS
+
+on:
+  push:
+    paths:
+      - 'rep.txt'
+  workflow_dispatch:
+
+env:
+  OSS_REGION: ${{ secrets.OSS_REGION }}
+  OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
+  OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+  OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+  OSS_ENDPOINT: ${{ secrets.OSS_ENDPOINT }}
+  OSS_PATH: ${{ secrets.OSS_PATH }}
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ossutil
+        run: |
+          wget -q https://gosspublic.alicdn.com/ossutil/1.7.18/ossutil-v1.7.18-linux-amd64.zip -O ossutil.zip
+          unzip -o ossutil.zip
+          mv ossutil-v1.7.18-linux-amd64/ossutil64 /usr/local/bin/ossutil
+          chmod +x /usr/local/bin/ossutil
+
+      - name: Configure ossutil
+        run: |
+          ossutil config \
+            -e "${OSS_ENDPOINT}" \
+            -i "${OSS_ACCESS_KEY_ID}" \
+            -k "${OSS_ACCESS_KEY_SECRET}"
+
+      - name: Download and upload files
+        run: |
+          WORKDIR="/tmp/oss_upload"
+          mkdir -p "$WORKDIR"
+
+          SUCCESS=0
+          FAIL=0
+
+          while IFS= read -r url || [[ -n "$url" ]]; do
+            # Skip empty lines and comments
+            url=$(echo "$url" | xargs)
+            if [[ -z "$url" || "$url" == \#* ]]; then
+              continue
+            fi
+
+            # Extract filename from URL
+            filename=$(basename "$(echo "$url" | sed 's/[?].*//')")
+
+            if [[ -z "$filename" ]]; then
+              echo "::warning::Cannot extract filename from: $url"
+              FAIL=$((FAIL + 1))
+              continue
+            fi
+
+            # Handle duplicate filenames by appending line number suffix
+            local_file="${WORKDIR}/${filename}"
+            if [[ -f "$local_file" ]]; then
+              line_num=$(grep -n "$url" rep.txt | head -1 | cut -d: -f1)
+              filename="${filename}_${line_num}"
+              local_file="${WORKDIR}/${filename}"
+            fi
+
+            echo "Downloading: $url -> $filename"
+            if curl -fSL --retry 3 --retry-delay 5 --connect-timeout 30 -o "$local_file" "$url"; then
+              # Determine OSS target path
+              if [[ -n "$OSS_PATH" ]]; then
+                oss_target="oss://${OSS_BUCKET}/${OSS_PATH}/${filename}"
+              else
+                oss_target="oss://${OSS_BUCKET}/${filename}"
+              fi
+
+              echo "Uploading: $local_file -> $oss_target"
+              if ossutil cp "$local_file" "$oss_target" -f; then
+                echo "::notice::Uploaded $filename successfully"
+                SUCCESS=$((SUCCESS + 1))
+              else
+                echo "::error::Failed to upload $filename to OSS"
+                FAIL=$((FAIL + 1))
+              fi
+            else
+              echo "::error::Failed to download: $url"
+              FAIL=$((FAIL + 1))
+            fi
+
+            # Clean up local file
+            rm -f "$local_file"
+          done < rep.txt
+
+          echo ""
+          echo "========================================="
+          echo "Summary: $SUCCESS succeeded, $FAIL failed"
+          echo "========================================="
+
+          if [[ $FAIL -gt 0 ]]; then
+            echo "::warning::$FAIL files failed to process"
+          fi
