@@ -1,1 +1,1 @@
-https://github.com/Lvbey/regexp_search/archive/refs/heads/main.zip
+https://github.com/anthropics/claude-code/releases/download/v2.1.160/claude-win32-x64.zip
