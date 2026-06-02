@@ -1,1 +1,1 @@
-https://github.com/anthropics/claude-code/releases/download/v2.1.160/claude-win32-x64.zip
+https://github.com/git-for-windows/git/releases/download/v2.54.0.windows.1/PortableGit-2.54.0-64-bit.7z.exe
