@@ -1,2 +1,1 @@
-https://dl.google.com/android/repository/platform-33-ext3_r03.zip
-https://dl.google.com/android/repository/build-tools_r33.0.2-windows.zip
+https://github.com/NousResearch/hermes-agent/archive/refs/heads/main.zip
