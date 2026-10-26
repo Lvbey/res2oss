@@ -5,6 +5,22 @@ on:
     paths:
       - 'rep.txt'
   workflow_dispatch:
+    inputs:
+      url:
+        description: 'Single file URL (leave empty to process rep.txt)'
+        required: false
+        type: string
+      request_id:
+        description: 'res2oss-server task UUID'
+        required: false
+        type: string
+      callback_url:
+        description: 'res2oss-server callback URL'
+        required: false
+        type: string
+
+permissions:
+  contents: read
 
 env:
   OSS_REGION: ${{ secrets.OSS_REGION }}
@@ -13,6 +29,8 @@ env:
   OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
   OSS_ENDPOINT: ${{ secrets.OSS_ENDPOINT }}
   OSS_PATH: ${{ secrets.OSS_PATH }}
+  CALLBACK_HMAC_SECRET: ${{ secrets.RES2OSS_CALLBACK_HMAC_SECRET }}
+  MAX_FILE_SIZE_BYTES: ${{ vars.RES2OSS_MAX_FILE_SIZE_BYTES || '1073741824' }}
 
 jobs:
   upload:
@@ -35,69 +53,141 @@ jobs:
             -i "${OSS_ACCESS_KEY_ID}" \
             -k "${OSS_ACCESS_KEY_SECRET}"
 
-      - name: Download and upload files
+      - name: Download and upload
+        id: transfer
+        env:
+          INPUT_URL: ${{ inputs.url }}
+          REQUEST_ID: ${{ inputs.request_id }}
+        shell: bash
         run: |
+          set -uo pipefail
           WORKDIR="/tmp/oss_upload"
           mkdir -p "$WORKDIR"
+          RESULT_FILE="$RUNNER_TEMP/res2oss-result.json"
+          printf '{"status":"failed","request_id":"%s","error":"Task did not complete"}\n' "$REQUEST_ID" > "$RESULT_FILE"
 
-          SUCCESS=0
-          FAIL=0
-
-          while IFS= read -r url || [[ -n "$url" ]]; do
-            # Skip empty lines and comments
-            url=$(echo "$url" | xargs)
-            if [[ -z "$url" || "$url" == \#* ]]; then
-              continue
+          process_url() {
+            local url="$1"
+            local request_id="$2"
+            local line_number="$3"
+            local filename encoded_name local_file object_key oss_target file_size sha256
+            filename="$(python - "$url" <<'PY'
+          import sys
+          from urllib.parse import urlparse, unquote
+          name = unquote(urlparse(sys.argv[1]).path.rsplit("/", 1)[-1])
+          print(name if name and name not in (".", "..") else "")
+          PY
+          )"
+            if [[ -z "$filename" || "$filename" == */* || "$filename" == *$'\n'* ]]; then
+              echo "Cannot safely determine filename from URL" >&2
+              return 1
             fi
 
-            # Extract filename from URL
-            filename=$(basename "$(echo "$url" | sed 's/[?].*//')")
-
-            if [[ -z "$filename" ]]; then
-              echo "::warning::Cannot extract filename from: $url"
-              FAIL=$((FAIL + 1))
-              continue
+            # For web tasks, isolate every object by task UUID. Legacy rep.txt tasks keep their prior timestamped layout.
+            if [[ -n "$request_id" ]]; then
+              local_file="$WORKDIR/$request_id-$filename"
+              object_key="${OSS_PATH:+${OSS_PATH%/}/}web/$(date -u +%Y/%m/%d)/$request_id/$filename"
+            else
+              local_file="$WORKDIR/$line_number-$filename"
+              object_key="${OSS_PATH:+${OSS_PATH%/}/}$(date -u +%Y%m%d_%H%M%S)_$filename"
             fi
 
-            # Handle duplicate filenames by appending line number suffix
-            local_file="${WORKDIR}/${filename}"
-            if [[ -f "$local_file" ]]; then
-              line_num=$(grep -n "$url" rep.txt | head -1 | cut -d: -f1)
-              filename="${filename}_${line_num}"
-              local_file="${WORKDIR}/${filename}"
+            echo "Downloading file (URL omitted from logs) to $filename"
+            # Do not follow redirects to private/local networks; curl's redirect handling alone is not a complete SSRF defense.
+            if ! curl --fail --show-error --silent --location --max-redirs 3 \
+              --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 1800 \
+              --max-filesize "$MAX_FILE_SIZE_BYTES" -o "$local_file" "$url"; then
+              rm -f "$local_file"
+              echo "Download failed or exceeded configured limits" >&2
+              return 1
             fi
-            DATETIMESTR=$(date +"%Y%m%d_%H%M%S")
-            echo "Downloading: $url -> $filename"
-            if curl -fSL --retry 3 --retry-delay 5 --connect-timeout 30 -o "$local_file" "$url"; then
-              # Determine OSS target path
-              if [[ -n "$OSS_PATH" ]]; then
-                oss_target="oss://${OSS_BUCKET}/${OSS_PATH}/${DATETIMESTR}_${filename}"
-              else
-                oss_target="oss://${OSS_BUCKET}/${DATETIMESTR}_${filename}"
-              fi
+            file_size="$(stat -c '%s' "$local_file")"
+            if (( file_size > MAX_FILE_SIZE_BYTES )); then
+              rm -f "$local_file"
+              echo "File exceeds configured maximum size" >&2
+              return 1
+            fi
+            sha256="$(sha256sum "$local_file" | awk '{print $1}')"
+            oss_target="oss://$OSS_BUCKET/$object_key"
+            if ! ossutil cp "$local_file" "$oss_target" -f; then
+              rm -f "$local_file"
+              echo "OSS upload failed" >&2
+              return 1
+            fi
+            rm -f "$local_file"
 
-              echo "Uploading: $local_file -> $oss_target"
-              if ossutil cp "$local_file" "$oss_target" -f; then
-                echo "::notice::Uploaded $filename successfully"
+            if [[ -n "$request_id" ]]; then
+              python - "$RESULT_FILE" "$request_id" "$filename" "$object_key" "$file_size" "$sha256" <<'PY'
+          import json, sys
+          path, request_id, filename, key, size, digest = sys.argv[1:]
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump({"status":"success","request_id":request_id,"filename":filename,"object_key":key,"file_size":int(size),"sha256":digest,"error":None}, f)
+          PY
+            fi
+            echo "Uploaded successfully: $filename ($file_size bytes)"
+          }
+
+          if [[ -n "${INPUT_URL:-}" ]]; then
+            if [[ -z "${REQUEST_ID:-}" || ! "$REQUEST_ID" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+              echo "Web dispatch requires a valid request_id" >&2
+              exit 2
+            fi
+            process_url "$INPUT_URL" "$REQUEST_ID" "web" || {
+              python - "$RESULT_FILE" "$REQUEST_ID" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as f:
+              json.dump({"status":"failed","request_id":sys.argv[2],"error":"Download or OSS upload failed"}, f)
+          PY
+            }
+          else
+            SUCCESS=0
+            FAIL=0
+            while IFS= read -r url || [[ -n "$url" ]]; do
+              url="$(printf '%s' "$url" | xargs)"
+              [[ -z "$url" || "$url" == \#* ]] && continue
+              if process_url "$url" "" "$((SUCCESS + FAIL + 1))"; then
                 SUCCESS=$((SUCCESS + 1))
               else
-                echo "::error::Failed to upload $filename to OSS"
                 FAIL=$((FAIL + 1))
               fi
-            else
-              echo "::error::Failed to download: $url"
-              FAIL=$((FAIL + 1))
+            done < rep.txt
+            echo "Summary: $SUCCESS succeeded, $FAIL failed"
+            if (( FAIL > 0 )); then
+              echo "::warning::$FAIL files failed to process"
             fi
-
-            # Clean up local file
-            rm -f "$local_file"
-          done < rep.txt
-
-          echo ""
-          echo "========================================="
-          echo "Summary: $SUCCESS succeeded, $FAIL failed"
-          echo "========================================="
-
-          if [[ $FAIL -gt 0 ]]; then
-            echo "::warning::$FAIL files failed to process"
           fi
+
+      - name: Report result to res2oss-server
+        if: ${{ always() && inputs.request_id != '' && inputs.callback_url != '' }}
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESULT_FILE="$RUNNER_TEMP/res2oss-result.json"
+          if [[ ! -f "$RESULT_FILE" ]]; then
+            python - "$RESULT_FILE" "$REQUEST_ID" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as f:
+              json.dump({"status":"failed","request_id":sys.argv[2],"error":"Workflow failed before transfer result was produced"}, f)
+          PY
+          fi
+          TIMESTAMP="$(date +%s)"
+          python - "$RESULT_FILE" "$TIMESTAMP" "$GITHUB_RUN_ID" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" "$RUNNER_TEMP/res2oss-callback.json" <<'PY'
+          import json, sys
+          src, timestamp, run_id, run_url, dest = sys.argv[1:]
+          with open(src, encoding="utf-8") as f:
+              data = json.load(f)
+          data.update({"timestamp": int(timestamp), "workflow_run_id": int(run_id), "workflow_url": run_url})
+          with open(dest, "w", encoding="utf-8") as f:
+              json.dump(data, f, separators=(",", ":"), ensure_ascii=False)
+          PY
+          BODY="$(cat "$RUNNER_TEMP/res2oss-callback.json")"
+          SIGNATURE="$(printf '%s.%s' "$TIMESTAMP" "$BODY" | openssl dgst -sha256 -hmac "$CALLBACK_HMAC_SECRET" -hex | awk '{print $NF}')"
+          curl --fail --silent --show-error --max-time 20 \
+            -X POST "$CALLBACK_URL" \
+            -H 'Content-Type: application/json' \
+            -H "X-Res2oss-Timestamp: $TIMESTAMP" \
+            -H "X-Res2oss-Signature: sha256=$SIGNATURE" \
+            --data-binary "$BODY"
