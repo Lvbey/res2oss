@@ -61,6 +61,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          : "${MAX_FILE_SIZE_BYTES:=1073741824}"
           WORKDIR="/tmp/oss_upload"
           mkdir -p "$WORKDIR"
           RESULT_FILE="$RUNNER_TEMP/res2oss-result.json"
